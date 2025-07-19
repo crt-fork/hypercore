@@ -1,6 +1,6 @@
 # Hypercore
 
-### [See the full API docs at docs.holepunch.to](https://docs.holepunch.to/building-blocks/hypercore)
+### [See the full API docs at docs.pears.com](https://docs.pears.com/building-blocks/hypercore)
 
 Hypercore is a secure, distributed append-only log.
 
@@ -23,6 +23,11 @@ Version 10 is not compatible with earlier versions (9 and earlier), but is consi
 npm install hypercore
 ```
 
+> [!NOTE]
+> This readme reflects Hypercore 11, our latest major version that is backed by RocksDB for storage and atomicity.
+> Whilst we are fully validating that, the npm dist-tag for latest is set to latest version of Hypercore 10, the previous major, to avoid too much disruption.
+> It will be updated to 11 in a few weeks.
+
 ## API
 
 #### `const core = new Hypercore(storage, [key], [options])`
@@ -35,31 +40,9 @@ Make a new Hypercore instance.
 const core = new Hypercore('./directory') // store data in ./directory
 ```
 
-Alternatively you can pass a function instead that is called with every filename Hypercore needs to function and return your own [abstract-random-access](https://github.com/random-access-storage/abstract-random-access) instance that is used to store the data.
+Alternatively you can pass a [Hypercore Storage](https://github.com/holepunchto/hypercore-storage) or use a [Corestore](https://github.com/holepunchto/corestore) if you want to make many Hypercores efficiently. Note that `random-access-storage` is no longer supported.
 
-``` js
-const RAM = require('random-access-memory')
-const core = new Hypercore((filename) => {
-  // filename will be one of: data, bitfield, tree, signatures, key, secret_key
-  // the data file will contain all your data concatenated.
-
-  // just store all files in ram by returning a random-access-memory instance
-  return new RAM()
-})
-```
-
-Per default Hypercore uses [random-access-file](https://github.com/random-access-storage/random-access-file). This is also useful if you want to store specific files in other directories.
-
-Hypercore will produce the following files:
-
-* `oplog` - The internal truncating journal/oplog that tracks mutations, the public key and other metadata.
-* `tree` - The Merkle Tree file.
-* `bitfield` - The bitfield of which data blocks this core has.
-* `data` - The raw data of each block.
-
-Note that `tree`, `data`, and `bitfield` are normally heavily sparse files.
-
-`key` can be set to a Hypercore public key. If you do not set this the public key will be loaded from storage. If no key exists a new key pair will be generated.
+`key` can be set to a Hypercore key which is a hash of Hypercore's internal auth manifest, describing how to validate the Hypercore. If you do not set this, it will be loaded from storage. If nothing is previously stored, a new auth manifest will be generated giving you local write access to it.
 
 `options` include:
 
@@ -67,20 +50,25 @@ Note that `tree`, `data`, and `bitfield` are normally heavily sparse files.
 {
   createIfMissing: true, // create a new Hypercore key pair if none was present in storage
   overwrite: false, // overwrite any old Hypercore that might already exist
-  sparse: true, // enable sparse mode, counting unavailable blocks towards core.length and core.byteLength
   valueEncoding: 'json' | 'utf-8' | 'binary', // defaults to binary
   encodeBatch: batch => { ... }, // optionally apply an encoding to complete batches
   keyPair: kp, // optionally pass the public key and secret key as a key pair
-  encryptionKey: k, // optionally pass an encryption key to enable block encryption
+  encryption: { key: buffer }, // the block encryption key
   onwait: () => {}, // hook that is called if gets are waiting for download
   timeout: 0, // wait at max some milliseconds (0 means no timeout)
-  writable: true // disable appends and truncates
+  writable: true, // disable appends and truncates
+  inflightRange: null, // Advanced option. Set to [minInflight, maxInflight] to change the min and max inflight blocks per peer when downloading.
+  ongc: (session) => { ... }, // A callback called when the session is garbage collected
+  notDownloadingLinger: 20000, // How many milliseconds to wait after downloading finishes keeping the connection open. Defaults to a random number between 20-40s
+  allowFork: true, // Enables updating core when it forks
 }
 ```
 
-You can also set valueEncoding to any [abstract-encoding](https://github.com/mafintosh/abstract-encoding) or [compact-encoding](https://github.com/compact-encoding) instance.
+You can also set valueEncoding to any [compact-encoding](https://github.com/compact-encoding) instance.
 
 valueEncodings will be applied to individual blocks, even if you append batches. If you want to control encoding at the batch-level, you can use the `encodeBatch` option, which is a function that takes a batch and returns a binary-encoded batch. If you provide a custom valueEncoding, it will not be applied prior to `encodeBatch`.
+
+The user may provide a custom encryption module as `opts.encryption`, which should satisfy the [HypercoreEncryption](https://github.com/holepunchto/hypercore-encryption) interface.
 
 #### `const { length, byteLength } = await core.append(block)`
 
@@ -177,7 +165,7 @@ Make a read stream to read a range of data out at once.
 // read the full core
 const fullStream = core.createReadStream()
 
-// read from block 10-15
+// read from block 10-14
 const partialStream = core.createReadStream({ start: 10, end: 15 })
 
 // pipe the stream somewhere using the .pipe method on Node.js or consume it as
@@ -254,10 +242,6 @@ Truncate the core to a smaller length.
 Per default this will update the fork id of the core to `+ 1`, but you can set the fork id you prefer with the option.
 Note that the fork id should be monotonely incrementing.
 
-#### `await core.purge()`
-
-Purge the hypercore from your storage, completely removing all data.
-
 #### `const hash = await core.treeHash([length])`
 
 Get the Merkle Tree hash of the core at a given length, defaulting to the current length of the core.
@@ -304,7 +288,7 @@ To cancel downloading a range simply destroy the range instance.
 range.destroy()
 ```
 
-#### `const session = await core.session([options])`
+#### `const session = core.session([options])`
 
 Creates a new Hypercore instance that shares the same underlying core.
 
@@ -312,7 +296,46 @@ You must close any session you make.
 
 Options are inherited from the parent instance, unless they are re-set.
 
-`options` are the same as in the constructor.
+`options` are the same as in the constructor with the follow additions:
+
+```
+{
+  weak: false // Creates the session as a "weak ref" which closes when all non-weak sessions are closed
+  exclusive: false, // Create a session with exclusive access to the core. Creating an exclusive session on a core with other exclusive sessions, will wait for the session with access to close before the next exclusive session is `ready`
+  checkout: undefined, // A index to checkout the core at. Checkout sessions must be an atom or a named session
+  atom: undefined, // A storage atom for making atomic batch changes across hypercores
+  name: null, // Name the session creating a persisted branch of the core. Still beta so may break in the future
+}
+```
+
+Atoms allow making atomic changes across multiple hypercores. Atoms can be created using a `core`'s `storage` (eg. `const atom = core.state.storage.createAtom()`). Changes made with an atom based session is not persisted until the atom is flushed via `await atom.flush()`, but can be read at any time. When atoms flush, all changes made outside of the atom will be clobbered as the core blocks will now match the atom's blocks. For example:
+
+```js
+const core = new Hypercore('./atom-example')
+await core.ready()
+
+await core.append('block 1')
+
+const atom = core.state.storage.createAtom()
+const atomicSession = core.session({ atom })
+
+await core.append('block 2') // Add blocks not using the atom
+
+await atomicSession.append('atom block 2') // Add different block to atom
+await atom.flush()
+
+console.log((await core.get(core.length - 1)).toString()) // prints 'atom block 2' not 'block 2'
+```
+
+#### `const { byteLength, length } = core.commit(session, opts = {})`
+
+Attempt to apply blocks from the session to the `core`. `core` must be a default core, aka a non-named session.
+
+Returns `null` if committing failed.
+
+#### `const snapshot = core.snapshot([options])`
+
+Same as above, but backed by a storage snapshot so will not truncate nor append.
 
 #### `const info = await core.info([options])`
 
@@ -404,13 +427,15 @@ In contrast to `core.key` this key does not allow you to verify the data but can
 
 Populated after `ready` has been emitted. Will be `null` before the event.
 
-#### `core.encryptionKey`
-
-Buffer containing the optional block encryption key of this core. Will be `null` unless block encryption is enabled.
-
 #### `core.length`
 
-How many blocks of data are available on this core? If `sparse: false`, this will equal `core.contiguousLength`.
+How many blocks of data are available on this core.
+
+Populated after `ready` has been emitted. Will be `0` before the event.
+
+#### `core.signedLength`
+
+How many blocks of data are available on this core that have been signed by a quorum. This is equal to `core.length` for Hypercores's with a single signer.
 
 Populated after `ready` has been emitted. Will be `0` before the event.
 
@@ -477,3 +502,11 @@ Emitted when a new connection has been established with a peer.
 #### `core.on('peer-remove')`
 
 Emitted when a peer's connection has been closed.
+
+#### `core.on('upload', index, byteLength, peer)`
+
+Emitted when a block is uploaded to a peer.
+
+#### `core.on('download', index, byteLength, peer)`
+
+Emitted when a block is downloaded from a peer.
